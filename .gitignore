@@ -1,0 +1,23 @@
+# --- Database & Data ---
+village_health.db
+health_reports.csv
+
+# --- Python Environment ---
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+.env
+
+# --- Streamlit Secrets & Config ---
+.streamlit/
+! .streamlit/config.toml
+
+# --- Local Utility Scripts ---
+check_db.py
+check_ml.py
+
+# --- System Files ---
+.DS_Store
+Thumbs.db
