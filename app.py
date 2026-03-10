@@ -12,6 +12,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 import pickle
 import sqlite3
+import bcrypt
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -24,6 +25,10 @@ st.set_page_config(
 # --- CONSTANTS & DATABASE ---
 DATA_FILE = "health_reports.csv"
 DB_FILE = "village_health.db"
+UPLOAD_DIR = "uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
 VILLAGE_COORDS = {
     "Mawsynram": [25.2975, 91.5826],
     "Cherrapunji": [25.2702, 91.7323],
@@ -453,9 +458,76 @@ def init_db():
             water_source TEXT,
             water_quality TEXT,
             risk_level TEXT,
-            report_date TEXT
+            report_date TEXT,
+            location TEXT,
+            image_path TEXT,
+            progress TEXT DEFAULT 'Unresolved',
+            reporter TEXT
         )
     ''')
+    
+    # Add missing columns if they don't exist (Migration)
+    try:
+        c.execute("ALTER TABLE health_reports ADD COLUMN location TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE health_reports ADD COLUMN image_path TEXT")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE health_reports ADD COLUMN progress TEXT DEFAULT 'Unresolved'")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE health_reports ADD COLUMN reporter TEXT")
+    except:
+        pass
+
+    # Create report_updates table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS report_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER,
+            update_text TEXT,
+            update_date TEXT,
+            updated_by TEXT,
+            update_photo_path TEXT,
+            update_status TEXT DEFAULT 'Pending',
+            admin_comment TEXT,
+            FOREIGN KEY(report_id) REFERENCES health_reports(id)
+        )
+    ''')
+
+    try:
+        c.execute("ALTER TABLE report_updates ADD COLUMN update_photo_path TEXT")
+    except: pass
+    try:
+        c.execute("ALTER TABLE report_updates ADD COLUMN update_status TEXT DEFAULT 'Pending'")
+    except: pass
+    try:
+        c.execute("ALTER TABLE report_updates ADD COLUMN admin_comment TEXT")
+    except: pass
+
+    # Create users table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            role TEXT, -- 'super_admin', 'admin', 'field_team', 'surveyor'
+            created_by INTEGER,
+            FOREIGN KEY (created_by) REFERENCES users (id)
+        )
+    ''')
+
+    # Add a default super admin if no users exist
+    c.execute("SELECT COUNT(*) FROM users")
+    if c.fetchone()[0] == 0:
+        password = "superadmin123"
+        hashed = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        c.execute("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)", 
+                  ("superadmin", hashed, "super_admin"))
     
     # Optional: Migrate existing CSV data to SQL if DB is empty
     c.execute("SELECT COUNT(*) FROM health_reports")
@@ -483,21 +555,110 @@ def load_data():
     conn.close()
     
     if not df.empty:
-        # Rename columns to match existing logic
-        df.columns = ["ID", "Village", "Latitude", "Longitude", "Symptom Count", "Symptoms", "Water Source", "Water Quality", "Risk Level", "Date"]
+        # Rename columns to match existing logic (Added Location and Image URL)
+        df.columns = ["ID", "Village", "Latitude", "Longitude", "Symptom Count", "Symptoms", "Water Source", "Water Quality", "Risk Level", "Date", "Location", "Image Path", "Progress", "Reporter"]
         df['Date'] = pd.to_datetime(df['Date'], format='mixed', errors='coerce')
         return df
-    return pd.DataFrame(columns=["Village", "Latitude", "Longitude", "Symptom Count", "Symptoms", "Water Source", "Water Quality", "Risk Level", "Date"])
+    return pd.DataFrame(columns=["ID", "Village", "Latitude", "Longitude", "Symptom Count", "Symptoms", "Water Source", "Water Quality", "Risk Level", "Date", "Location", "Image Path", "Progress", "Reporter"])
 
 def save_data(new_record):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
-        INSERT INTO health_reports (village, latitude, longitude, symptom_count, symptoms, water_source, water_quality, risk_level, report_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (new_record['Village'], new_record['Latitude'], new_record['Longitude'], new_record['Symptom Count'], new_record['Symptoms'], new_record['Water Source'], new_record['Water Quality'], new_record['Risk Level'], new_record['Date']))
+        INSERT INTO health_reports (village, latitude, longitude, symptom_count, symptoms, water_source, water_quality, risk_level, report_date, location, image_path, progress, reporter)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (new_record['Village'], new_record['Latitude'], new_record['Longitude'], new_record['Symptom Count'], new_record['Symptoms'], new_record['Water Source'], new_record['Water Quality'], new_record['Risk Level'], new_record['Date'], new_record['Location'], new_record['Image Path'], new_record['Progress'], new_record['Reporter']))
     conn.commit()
     conn.close()
+
+def get_report_updates(report_id):
+    conn = sqlite3.connect(DB_FILE)
+    query = f"SELECT * FROM report_updates WHERE report_id = {report_id} ORDER BY id ASC"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+def add_report_update(report_id, update_text, updated_by, custom_date, update_photo_path):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT INTO report_updates (report_id, update_text, update_date, updated_by, update_photo_path, update_status) VALUES (?, ?, ?, ?, ?, 'Pending')",
+              (report_id, update_text, custom_date, updated_by, update_photo_path))
+    conn.commit()
+    conn.close()
+
+def resolve_report_update(update_id, action, admin_comment):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE report_updates SET update_status = ?, admin_comment = ? WHERE id = ?", (action, admin_comment, update_id))
+    
+    if action == 'Accepted':
+        c.execute("SELECT report_id FROM report_updates WHERE id = ?", (update_id,))
+        row = c.fetchone()
+        if row:
+            c.execute("UPDATE health_reports SET progress = 'Resolved' WHERE id = ?", (row[0],))
+            
+    conn.commit()
+    conn.close()
+
+# --- AUTHENTICATION HELPERS ---
+def hash_password(password):
+    # Use bcrypt for hashing
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def check_password(password, hashed):
+    # Verify password with bcrypt
+    return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
+
+def add_user(username, password, role, created_by=None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    hashed = hash_password(password)
+    try:
+        c.execute("INSERT INTO users (username, password_hash, role, created_by) VALUES (?, ?, ?, ?)", 
+                  (username, hashed, role, created_by))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        st.error(f"Error adding user: {e}")
+        return False
+    finally:
+        conn.close()
+
+def get_all_users(creator_id=None, role=None):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    if role == 'super_admin': 
+        # Superadmin can see everyone
+        c.execute("SELECT id, username, role FROM users")
+    elif role == 'admin': 
+        # Admins can see teams and surveyors they created
+        # Note: Super Admin might have created some as well, but usually admins manage their own
+        c.execute("SELECT id, username, role FROM users WHERE created_by = ? OR role IN ('field_team', 'surveyor')", (creator_id,))
+    else:
+        conn.close()
+        return []
+    users = c.fetchall()
+    conn.close()
+    return users
+
+def verify_user(username, password):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, username, password_hash, role FROM users WHERE username = ?", (username,))
+    user = c.fetchone()
+    conn.close()
+    if user and check_password(password, user[2]):
+        return {'id': user[0], 'username': user[1], 'role': user[3]}
+    return None
+
+# --- SESSION STATE INIT ---
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+if 'app_page' not in st.session_state:
+    st.session_state.app_page = "Home"
 
 # --- AI MODEL (Random Forest) ---
 def initialize_ai_model():
@@ -787,42 +948,196 @@ def show_home():
 
 # --- PAGE: REPORT SYMPTOMS ---
 def show_report_form():
-    st.title("📝 Submit Community Health Report")
-    st.markdown("Fill out the form below to report health symptoms in your village.")
-    
-    with st.form("health_report_form"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            village = st.selectbox("Village Name", list(VILLAGE_COORDS.keys()))
-            symptom_count = st.number_input("Number of People with Symptoms", min_value=0, step=1)
-            report_date = st.date_input("Date of Observation", datetime.now())
-            
-        with col2:
-            water_source = st.selectbox("Primary Water Source", ["River", "Well", "Tap", "Hand Pump"])
-            water_quality = st.selectbox("Water Quality Indicator", ["Clean", "Slightly Contaminated", "Contaminated"])
-            symptoms = st.multiselect("Symptoms Observed", ["Diarrhea", "Vomiting", "Fever", "Dehydration"])
+    st.title("Community Health Reports & Forum")
+    tab1, tab2 = st.tabs(["📝 Submit New Report", "💬 Submitted Reports & Forum (Updates)"])
 
-        st.markdown("---")
-        submitted = st.form_submit_button("Submit Health Report")
+    with tab1:
+        st.markdown("Fill out the form below to report health symptoms in your village.")
         
-        if submitted:
-            risk = predict_risk(symptom_count, water_quality)
-            new_record = {
-                "Village": village,
-                "Latitude": VILLAGE_COORDS[village][0],
-                "Longitude": VILLAGE_COORDS[village][1],
-                "Symptom Count": symptom_count,
-                "Symptoms": ", ".join(symptoms) if symptoms else "None",
-                "Water Source": water_source,
-                "Water Quality": water_quality,
-                "Risk Level": risk,
-                "Date": report_date.strftime("%Y-%m-%d")
-            }
-            save_data(new_record)
-            st.success(f"Report submitted successfully for {village}! Risk Level: **{risk}**")
-            if risk == "High Risk":
-                st.warning("⚠️ Immediate action may be required. Boiling water is highly recommended.")
+        with st.form("health_report_form"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                village = st.selectbox("Village Name", list(VILLAGE_COORDS.keys()))
+                location_text = st.text_input("Specific Location / Landmark", placeholder="e.g. Near Primary School")
+                symptom_count = st.number_input("Number of People with Symptoms", min_value=0, step=1)
+                report_date = st.date_input("Date of Observation", datetime.now())
+                
+            with col2:
+                water_source = st.selectbox("Primary Water Source", ["River", "Well", "Tap", "Hand Pump"])
+                water_quality = st.selectbox("Water Quality Indicator", ["Clean", "Slightly Contaminated", "Contaminated"])
+                symptoms = st.multiselect("Symptoms Observed", ["Diarrhea", "Vomiting", "Fever", "Dehydration"])
+                uploaded_file = st.file_uploader("Upload Evidence Photo", type=['png', 'jpg', 'jpeg'])
+
+            st.text_input("Progress", value="Unresolved", disabled=True, help="New reports are Unresolved by default. Update them in the Forum tab.")
+
+            st.markdown("---")
+            submitted = st.form_submit_button("Submit Health Report")
+            
+            if submitted:
+                # Save image if exists
+                image_path = ""
+                if uploaded_file is not None:
+                    file_path = os.path.join(UPLOAD_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_file.name}")
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    image_path = file_path
+
+                risk = predict_risk(symptom_count, water_quality)
+                reporter_name = st.session_state.user['username'] if st.session_state.user else "Anonymous"
+                new_record = {
+                    "Village": village,
+                    "Latitude": VILLAGE_COORDS[village][0],
+                    "Longitude": VILLAGE_COORDS[village][1],
+                    "Symptom Count": symptom_count,
+                    "Symptoms": ", ".join(symptoms) if symptoms else "None",
+                    "Water Source": water_source,
+                    "Water Quality": water_quality,
+                    "Risk Level": risk,
+                    "Date": report_date.strftime("%Y-%m-%d"),
+                    "Location": location_text,
+                    "Image Path": image_path,
+                    "Progress": "Unresolved",
+                    "Reporter": reporter_name
+                }
+                save_data(new_record)
+                st.success(f"Report submitted successfully for {village}! Risk Level: **{risk}**")
+                st.balloons()
+                if risk == "High Risk":
+                    st.warning("⚠️ Immediate action may be required. Boiling water is highly recommended.")
+
+    with tab2:
+        st.markdown("### Community Health Forum")
+        st.write("View past reports and provide live updates as interventions and resolutions take place.")
+        
+        df = load_data()
+        
+        if df.empty:
+            st.info("No reports have been submitted yet.")
+        else:
+            # Sort by newest first
+            df_display = df.sort_values(by='ID', ascending=False)
+            
+            for index, row in df_display.iterrows():
+                report_id = row['ID']
+                with st.container():
+                    st.markdown(f"#### 📌 Report #{report_id} - {row['Village']} ({row['Date']})")
+                    progress_color = 'red' if row['Progress'] == 'Unresolved' else 'green'
+                    st.markdown(f"**Reporter:** {row['Reporter']} | **Progress:** <strong style='color:{progress_color};'>{row['Progress']}</strong>", unsafe_allow_html=True)
+                    st.markdown(f"- **Symptoms:** {row['Symptom Count']} cases ({row['Symptoms']})")
+                    st.markdown(f"- **Water Source:** {row['Water Source']} ({row['Water Quality']})")
+                    if row['Location']:
+                        st.markdown(f"- **Location:** {row['Location']}")
+                    if row['Image Path'] and os.path.exists(row['Image Path']):
+                        st.image(row['Image Path'], width=300)
+
+                    # Display forum thread (updates)
+                    updates_df = get_report_updates(report_id)
+                    current_user_obj = st.session_state.user
+                    is_admin = current_user_obj and current_user_obj.get('role') in ['super_admin', 'admin']
+
+                    if not updates_df.empty:
+                        for u_idx, u_row in updates_df.iterrows():
+                            update_id = int(u_row['id'])
+                            st.markdown(f"> 💬 **{u_row['updated_by']}** ({u_row['update_date']}): {u_row['update_text']}")
+                            
+                            update_photo = u_row.get('update_photo_path', None)
+                            if pd.notna(update_photo) and update_photo and os.path.exists(update_photo):
+                                st.image(update_photo, width=200)
+
+                            status = u_row['update_status'] if 'update_status' in u_row and pd.notna(u_row['update_status']) else 'Pending'
+                            existing_comment = u_row['admin_comment'] if 'admin_comment' in u_row and pd.notna(u_row['admin_comment']) else ''
+                            
+                            status_color = "orange" if status == "Pending" else "green" if status == "Accepted" else "red"
+                            st.markdown(f"> *Status: <strong style='color:{status_color}'>{status}</strong>*", unsafe_allow_html=True)
+                            
+                            if status in ["Accepted", "Rejected"] and existing_comment:
+                                st.markdown(f"> *Admin Comment:* {existing_comment}")
+
+                            # Admin / Super Admin action controls for pending updates
+                            if status == "Pending" and is_admin and row['Progress'] != 'Resolved':
+                                with st.form(f"forum_admin_action_{update_id}"):
+                                    admin_comment = st.text_area(
+                                        "💬 Comment",
+                                        placeholder="Provide feedback or comments on this update...",
+                                        key=f"forum_comment_{update_id}"
+                                    )
+                                    btn_col1, btn_col2 = st.columns(2)
+                                    with btn_col1:
+                                        accept_btn = st.form_submit_button("✅ Accept & Resolve")
+                                    with btn_col2:
+                                        reject_btn = st.form_submit_button("❌ Reject")
+
+                                    if accept_btn:
+                                        resolve_report_update(update_id, "Accepted", admin_comment)
+                                        st.success("Update accepted — report marked as Resolved.")
+                                        st.rerun()
+                                    elif reject_btn:
+                                        resolve_report_update(update_id, "Rejected", admin_comment)
+                                        st.warning("Update rejected — report remains Unresolved.")
+                                        st.rerun()
+
+                    # Bottom action area — different for admins vs workers
+                    if row['Progress'] != 'Resolved':
+                        if is_admin:
+                            # Admins see Comment + Accept/Reject controls on the report
+                            with st.expander(f"🛡️ Admin Action — Report #{report_id}", expanded=False):
+                                with st.form(f"admin_report_action_{report_id}"):
+                                    admin_comment = st.text_area(
+                                        "💬 Comment",
+                                        placeholder="Provide your feedback or decision notes...",
+                                        key=f"admin_report_comment_{report_id}"
+                                    )
+                                    btn_col1, btn_col2 = st.columns(2)
+                                    with btn_col1:
+                                        accept_btn = st.form_submit_button("✅ Accept & Resolve")
+                                    with btn_col2:
+                                        reject_btn = st.form_submit_button("❌ Reject")
+
+                                    if accept_btn:
+                                        # Add the admin comment as an update and mark as accepted/resolved
+                                        current_admin = st.session_state.user['username']
+                                        add_report_update(report_id, admin_comment or "Accepted by admin.", current_admin, datetime.now().strftime("%Y-%m-%d"), "")
+                                        # Get the latest update id and resolve it
+                                        latest_updates = get_report_updates(report_id)
+                                        if not latest_updates.empty:
+                                            latest_update_id = int(latest_updates.iloc[-1]['id'])
+                                            resolve_report_update(latest_update_id, "Accepted", admin_comment)
+                                        st.success("Report accepted — marked as Resolved.")
+                                        st.rerun()
+                                    elif reject_btn:
+                                        current_admin = st.session_state.user['username']
+                                        add_report_update(report_id, admin_comment or "Rejected by admin.", current_admin, datetime.now().strftime("%Y-%m-%d"), "")
+                                        latest_updates = get_report_updates(report_id)
+                                        if not latest_updates.empty:
+                                            latest_update_id = int(latest_updates.iloc[-1]['id'])
+                                            resolve_report_update(latest_update_id, "Rejected", admin_comment)
+                                        st.warning("Report rejected — remains Unresolved.")
+                                        st.rerun()
+                        else:
+                            # Non-admin users can add updates
+                            with st.expander(f"➕ Add Update to Issue #{report_id}"):
+                                with st.form(f"update_form_{report_id}"):
+                                    update_date = st.date_input("Update Date", datetime.now(), key=f"date_{report_id}")
+                                    update_notes = st.text_area("Update Details / Actions Taken")
+                                    update_photo_upload = st.file_uploader("Upload Updated Photo (Optional)", type=['png', 'jpg', 'jpeg'], key=f"photo_{report_id}")
+                                    update_submitted = st.form_submit_button("Post Update")
+                                    
+                                    if update_submitted:
+                                        update_photo_path = ""
+                                        if update_photo_upload is not None:
+                                            file_path = os.path.join(UPLOAD_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_update_{update_photo_upload.name}")
+                                            with open(file_path, "wb") as f:
+                                                f.write(update_photo_upload.getbuffer())
+                                            update_photo_path = file_path
+                                            
+                                        current_user = st.session_state.user['username'] if st.session_state.user else "Anonymous"
+                                        add_report_update(report_id, update_notes, current_user, update_date.strftime("%Y-%m-%d"), update_photo_path)
+                                        st.success("Update posted! Waiting for admin approval.")
+                                        st.rerun()
+                    else:
+                        st.info("✅ This issue has been Resolved and is now closed. No further updates can be made.")
+                    st.divider()
 
 # --- PAGE: RISK ANALYSIS ---
 def show_risk_analysis():
@@ -833,8 +1148,150 @@ def show_risk_analysis():
         st.warning("No data available for analysis.")
         return
 
+    # --- COMPREHENSIVE FILTER PANEL ---
+    st.markdown("""
+        <div style="background: linear-gradient(135deg, rgba(0, 210, 255, 0.08), rgba(0, 114, 255, 0.08));
+                    border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 16px;
+                    padding: 8px 18px; margin-bottom: 18px;">
+            <span style="color: #00f2fe; font-weight: 700; font-size: 1.1rem;">🔍 Data Filters</span>
+            <span style="color: #81d4fa; font-size: 0.85rem; margin-left: 10px;">
+                Refine the risk analysis charts and table below
+            </span>
+        </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("⚙️ **Filter Options** — Click to expand / collapse", expanded=True):
+        fcol1, fcol2, fcol3 = st.columns(3)
+        with fcol1:
+            all_villages = sorted(df['Village'].dropna().unique().tolist())
+            select_all_villages = st.checkbox("Select All Villages", value=True, key="risk_select_all_villages")
+            selected_villages = st.multiselect(
+                "🏘️ Village / Area",
+                options=all_villages,
+                default=all_villages if select_all_villages else [],
+                key="risk_filter_village"
+            )
+        with fcol2:
+            min_date = df['Date'].min().date() if not df['Date'].isna().all() else datetime.now().date()
+            max_date = df['Date'].max().date() if not df['Date'].isna().all() else datetime.now().date()
+            date_start = st.date_input("📅 Date From", value=min_date, min_value=min_date, max_value=max_date, key="risk_filter_date_start")
+            date_end = st.date_input("📅 Date To", value=max_date, min_value=min_date, max_value=max_date, key="risk_filter_date_end")
+        with fcol3:
+            all_reporters = sorted(df['Reporter'].dropna().unique().tolist())
+            select_all_reporters = st.checkbox("Select All Workers", value=True, key="risk_select_all_reporters")
+            selected_reporters = st.multiselect(
+                "👷 Reporter / Worker",
+                options=all_reporters,
+                default=all_reporters if select_all_reporters else [],
+                key="risk_filter_reporter"
+            )
+
+        fcol4, fcol5, fcol6, fcol7 = st.columns(4)
+        with fcol4:
+            all_risks = sorted(df['Risk Level'].dropna().unique().tolist())
+            selected_risks = st.multiselect(
+                "⚠️ Risk Level",
+                options=all_risks,
+                default=all_risks,
+                key="risk_filter_risk"
+            )
+        with fcol5:
+            all_water_sources = sorted(df['Water Source'].dropna().unique().tolist())
+            selected_water_sources = st.multiselect(
+                "💧 Water Source",
+                options=all_water_sources,
+                default=all_water_sources,
+                key="risk_filter_water_source"
+            )
+        with fcol6:
+            all_water_quality = sorted(df['Water Quality'].dropna().unique().tolist())
+            selected_water_quality = st.multiselect(
+                "🧪 Water Quality",
+                options=all_water_quality,
+                default=all_water_quality,
+                key="risk_filter_water_quality"
+            )
+        with fcol7:
+            all_progress = sorted(df['Progress'].dropna().unique().tolist())
+            selected_progress = st.multiselect(
+                "🔄 Progress",
+                options=all_progress,
+                default=all_progress,
+                key="risk_filter_progress"
+            )
+
+    # --- APPLY FILTERS ---
+    filtered_df = df.copy()
+    if selected_villages:
+        filtered_df = filtered_df[filtered_df['Village'].isin(selected_villages)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]  # empty if nothing selected
+    if selected_reporters:
+        filtered_df = filtered_df[filtered_df['Reporter'].isin(selected_reporters)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_risks:
+        filtered_df = filtered_df[filtered_df['Risk Level'].isin(selected_risks)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_water_sources:
+        filtered_df = filtered_df[filtered_df['Water Source'].isin(selected_water_sources)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_water_quality:
+        filtered_df = filtered_df[filtered_df['Water Quality'].isin(selected_water_quality)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_progress:
+        filtered_df = filtered_df[filtered_df['Progress'].isin(selected_progress)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    # Date range filter
+    filtered_df = filtered_df[
+        (filtered_df['Date'].dt.date >= date_start) &
+        (filtered_df['Date'].dt.date <= date_end)
+    ]
+
+    # --- FILTER SUMMARY ---
+    active_filters = []
+    if len(selected_villages) < len(all_villages):
+        active_filters.append(f"**Villages:** {len(selected_villages)}/{len(all_villages)}")
+    if date_start != min_date or date_end != max_date:
+        active_filters.append(f"**Date:** {date_start} → {date_end}")
+    if len(selected_reporters) < len(all_reporters):
+        active_filters.append(f"**Reporters:** {len(selected_reporters)}/{len(all_reporters)}")
+    if len(selected_risks) < len(all_risks):
+        active_filters.append(f"**Risk Levels:** {', '.join(selected_risks)}")
+    if len(selected_water_sources) < len(all_water_sources):
+        active_filters.append(f"**Water Sources:** {', '.join(selected_water_sources)}")
+    if len(selected_water_quality) < len(all_water_quality):
+        active_filters.append(f"**Water Quality:** {', '.join(selected_water_quality)}")
+    if len(selected_progress) < len(all_progress):
+        active_filters.append(f"**Progress:** {', '.join(selected_progress)}")
+
+    if active_filters:
+        st.markdown(
+            f"<div style='background: rgba(0, 242, 254, 0.06); border-left: 4px solid #00f2fe; "
+            f"padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.9rem;'>"
+            f"🎯 <b>Active Filters:</b> {' &nbsp;|&nbsp; '.join(active_filters)} "
+            f"&nbsp;— Showing <b>{len(filtered_df)}</b> of <b>{len(df)}</b> records</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"<div style='background: rgba(105, 240, 174, 0.06); border-left: 4px solid #69f0ae; "
+            f"padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.9rem;'>"
+            f"✅ Showing all <b>{len(filtered_df)}</b> records (no filters active)</div>",
+            unsafe_allow_html=True
+        )
+
+    if filtered_df.empty:
+        st.warning("No data matches the selected filters. Adjust your filters above.")
+        return
+
+    # --- RISK DISTRIBUTION (FILTERED) ---
     st.markdown("### Risk Distribution")
-    risk_counts = df['Risk Level'].value_counts().reset_index()
+    risk_counts = filtered_df['Risk Level'].value_counts().reset_index()
     risk_counts.columns = ['Risk Level', 'Count']
     
     col1, col2 = st.columns(2)
@@ -849,17 +1306,39 @@ def show_risk_analysis():
             paper_bgcolor='rgba(0,0,0,0)',
             font_color="#ffffff"
         )
-        st.plotly_chart(fig_pie)
+        st.plotly_chart(fig_pie, use_container_width=True)
         
     with col2:
         st.markdown("#### 🤖 AI Model Intelligence")
         st.write("Current calculation is powered by an **ensemble Random Forest Classifier**.")
-        
-        # Display Feature Importance (Static for now based on common RF outputs)
-        st.info("**Feature Importance (AI Weights):**")
+        # Dynamically evaluate Symptom Pulse and Hydro-Quality based on filtered data severity
+        if not filtered_df.empty:
+            total_filtered = len(filtered_df)
+            bad_water_count = len(filtered_df[filtered_df['Water Quality'] != 'Clean'])
+            # Calculate a representative hydro quality factor
+            hydro_pct = (bad_water_count / total_filtered) * 100 if total_filtered > 0 else 35.0
+            
+            # For symptom pulse, let's normalize the severity based on average symptoms
+            avg_symp = filtered_df['Symptom Count'].mean()
+            # If avg symptoms > 10, it's very high. Scale it.
+            symp_pct = min(100.0, max(0.0, avg_symp * 5))
+            
+            # Normalize them to sum to 100% just like weights
+            total_weight = hydro_pct + symp_pct
+            if total_weight > 0:
+                hydro_weight = (hydro_pct / total_weight) * 100
+                symp_weight = (symp_pct / total_weight) * 100
+            else:
+                hydro_weight = 35.0
+                symp_weight = 65.0
+        else:
+            symp_weight = 65.0
+            hydro_weight = 35.0
+            
+        st.info("**Feature Analytics (Dynamic Indicators):**")
         col_f1, col_f2 = st.columns(2)
-        col_f1.metric("Symptom Pulse", "65%", help="Weight assigned to reported symptom volume")
-        col_f2.metric("Hydro-Quality", "35%", help="Weight assigned to water contamination levels")
+        col_f1.metric("Symptom Pulse", f"{symp_weight:.1f}%", help="Calculated pulse from filtered symptom volume")
+        col_f2.metric("Hydro-Quality", f"{hydro_weight:.1f}%", help="Calculated from water contamination levels in filtered data")
         
         st.markdown("""
         **Model Logic:**
@@ -869,11 +1348,7 @@ def show_risk_analysis():
     st.markdown("---")
     st.subheader("Detailed Village Status")
     
-    # Filter by risk
-    selected_risk = st.multiselect("Filter by Risk Level", ["Low Risk", "Medium Risk", "High Risk"], default=["Low Risk", "Medium Risk", "High Risk"])
-    filtered_df = df[df['Risk Level'].isin(selected_risk)]
-    
-    display_cols = ["Village", "Symptom Count", "Symptoms", "Water Source", "Water Quality", "Risk Level", "Date"]
+    display_cols = ["Village", "Location", "Symptom Count", "Symptoms", "Water Source", "Water Quality", "Risk Level", "Date", "Reporter", "Image Path"]
     ordered_df = filtered_df[display_cols].sort_values('Date', ascending=False)
     
     st.dataframe(ordered_df, use_container_width=True, hide_index=True)
@@ -888,8 +1363,147 @@ def show_map_view():
         st.warning("No data available to display on map.")
         return
 
-    # Prepare latest data per village for mapping
-    latest_df = df.sort_values('Date').groupby('Village').tail(1)
+    # --- COMPREHENSIVE FILTER PANEL ---
+    st.markdown("""
+        <div style="background: linear-gradient(135deg, rgba(0, 210, 255, 0.08), rgba(0, 114, 255, 0.08));
+                    border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 16px;
+                    padding: 8px 18px; margin-bottom: 18px;">
+            <span style="color: #00f2fe; font-weight: 700; font-size: 1.1rem;">🔍 Map Filters</span>
+            <span style="color: #81d4fa; font-size: 0.85rem; margin-left: 10px;">
+                Filter which data points appear on the map
+            </span>
+        </div>
+    """, unsafe_allow_html=True)
+
+    with st.expander("⚙️ **Filter Options** — Click to expand / collapse", expanded=True):
+        fcol1, fcol2, fcol3 = st.columns(3)
+        with fcol1:
+            all_villages = sorted(df['Village'].dropna().unique().tolist())
+            select_all_villages = st.checkbox("Select All Villages", value=True, key="map_select_all_villages")
+            selected_villages = st.multiselect(
+                "🏘️ Village / Area",
+                options=all_villages,
+                default=all_villages if select_all_villages else [],
+                key="map_filter_village"
+            )
+        with fcol2:
+            min_date = df['Date'].min().date() if not df['Date'].isna().all() else datetime.now().date()
+            max_date = df['Date'].max().date() if not df['Date'].isna().all() else datetime.now().date()
+            date_start = st.date_input("📅 Date From", value=min_date, min_value=min_date, max_value=max_date, key="map_filter_date_start")
+            date_end = st.date_input("📅 Date To", value=max_date, min_value=min_date, max_value=max_date, key="map_filter_date_end")
+        with fcol3:
+            all_reporters = sorted(df['Reporter'].dropna().unique().tolist())
+            select_all_reporters = st.checkbox("Select All Workers", value=True, key="map_select_all_reporters")
+            selected_reporters = st.multiselect(
+                "👷 Reporter / Worker",
+                options=all_reporters,
+                default=all_reporters if select_all_reporters else [],
+                key="map_filter_reporter"
+            )
+
+        fcol4, fcol5, fcol6, fcol7 = st.columns(4)
+        with fcol4:
+            all_risks = sorted(df['Risk Level'].dropna().unique().tolist())
+            selected_risks = st.multiselect(
+                "⚠️ Risk Level",
+                options=all_risks,
+                default=all_risks,
+                key="map_filter_risk"
+            )
+        with fcol5:
+            all_water_sources = sorted(df['Water Source'].dropna().unique().tolist())
+            selected_water_sources = st.multiselect(
+                "💧 Water Source",
+                options=all_water_sources,
+                default=all_water_sources,
+                key="map_filter_water_source"
+            )
+        with fcol6:
+            all_water_quality = sorted(df['Water Quality'].dropna().unique().tolist())
+            selected_water_quality = st.multiselect(
+                "🧪 Water Quality",
+                options=all_water_quality,
+                default=all_water_quality,
+                key="map_filter_water_quality"
+            )
+        with fcol7:
+            all_progress = sorted(df['Progress'].dropna().unique().tolist())
+            selected_progress = st.multiselect(
+                "🔄 Progress",
+                options=all_progress,
+                default=all_progress,
+                key="map_filter_progress"
+            )
+
+    # --- APPLY FILTERS ---
+    filtered_df = df.copy()
+    if selected_villages:
+        filtered_df = filtered_df[filtered_df['Village'].isin(selected_villages)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_reporters:
+        filtered_df = filtered_df[filtered_df['Reporter'].isin(selected_reporters)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_risks:
+        filtered_df = filtered_df[filtered_df['Risk Level'].isin(selected_risks)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_water_sources:
+        filtered_df = filtered_df[filtered_df['Water Source'].isin(selected_water_sources)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    if selected_water_quality:
+        filtered_df = filtered_df[filtered_df['Water Quality'].isin(selected_water_quality)]
+    else:
+        filtered_df = filtered_df.iloc[0:0]
+    # Date range filter
+    if not filtered_df.empty:
+        filtered_df = filtered_df[
+            (filtered_df['Date'].dt.date >= date_start) &
+            (filtered_df['Date'].dt.date <= date_end)
+        ]
+
+    # --- FILTER SUMMARY ---
+    active_filters = []
+    if len(selected_villages) < len(all_villages):
+        active_filters.append(f"**Villages:** {len(selected_villages)}/{len(all_villages)}")
+    if date_start != min_date or date_end != max_date:
+        active_filters.append(f"**Date:** {date_start} → {date_end}")
+    if len(selected_reporters) < len(all_reporters):
+        active_filters.append(f"**Reporters:** {len(selected_reporters)}/{len(all_reporters)}")
+    if len(selected_risks) < len(all_risks):
+        active_filters.append(f"**Risk Levels:** {', '.join(selected_risks)}")
+    if len(selected_water_sources) < len(all_water_sources):
+        active_filters.append(f"**Water Sources:** {', '.join(selected_water_sources)}")
+    if len(selected_water_quality) < len(all_water_quality):
+        active_filters.append(f"**Water Quality:** {', '.join(selected_water_quality)}")
+
+    if active_filters:
+        st.markdown(
+            f"<div style='background: rgba(0, 242, 254, 0.06); border-left: 4px solid #00f2fe; "
+            f"padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.9rem;'>"
+            f"🎯 <b>Active Filters:</b> {' &nbsp;|&nbsp; '.join(active_filters)} "
+            f"&nbsp;— Showing <b>{len(filtered_df)}</b> of <b>{len(df)}</b> records on map</div>",
+            unsafe_allow_html=True
+        )
+    else:
+        st.markdown(
+            f"<div style='background: rgba(105, 240, 174, 0.06); border-left: 4px solid #69f0ae; "
+            f"padding: 10px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.9rem;'>"
+            f"✅ Showing all <b>{len(filtered_df)}</b> records on map (no filters active)</div>",
+            unsafe_allow_html=True
+        )
+
+    if filtered_df.empty:
+        st.warning("No data matches the selected filters. Adjust your filters above.")
+        # Still show an empty map
+        m = folium.Map(location=[26.0, 92.0], zoom_start=6, tiles="CartoDB dark_matter")
+        st_folium(m, width=1200, height=600)
+        return
+
+    # Prepare latest data per village from FILTERED data for mapping
+    latest_df = filtered_df.sort_values('Date').groupby('Village').tail(1)
     
     # Base map centered on North-East India
     m = folium.Map(location=[26.0, 92.0], zoom_start=6, tiles="CartoDB dark_matter")
@@ -903,6 +1517,7 @@ def show_map_view():
                      f"<b>Risk:</b> {row['Risk Level']}<br>" \
                      f"<b>Cases:</b> {row['Symptom Count']}<br>" \
                      f"<b>Water:</b> {row['Water Quality']}<br>" \
+                     f"<b>Reporter:</b> {row['Reporter']}<br>" \
                      f"<b>Last Updated:</b> {row['Date'].strftime('%Y-%m-%d')}"
         
         folium.CircleMarker(
@@ -1039,6 +1654,207 @@ def show_health_awareness():
         - **Self-Care**: Maintain personal hygiene and keep living areas clean.
         """)
 
+def show_logs():
+    st.title("🛡️ Admin Logs — Community Health Reports")
+
+    df = load_data()
+    if df.empty:
+        st.info("No reports have been submitted yet.")
+        return
+
+    # --- Notification Banner ---
+    conn = sqlite3.connect(DB_FILE)
+    pending_updates = pd.read_sql_query(
+        "SELECT ru.*, hr.village FROM report_updates ru "
+        "JOIN health_reports hr ON ru.report_id = hr.id "
+        "WHERE ru.update_status = 'Pending' ORDER BY ru.id DESC",
+        conn
+    )
+    conn.close()
+
+    if not pending_updates.empty:
+        st.markdown(
+            f"""<div style="background: linear-gradient(90deg, #ff6200, #ffb347); padding: 14px 20px;
+            border-radius: 12px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px;">
+            <span style="font-size: 1.6rem;">🔔</span>
+            <span style="color: white; font-weight: 700; font-size: 1rem;">
+                {len(pending_updates)} pending update(s) awaiting your review
+            </span></div>""",
+            unsafe_allow_html=True
+        )
+
+    st.markdown("---")
+
+    # Filter controls
+    filter_col1, filter_col2 = st.columns(2)
+    with filter_col1:
+        filter_progress = st.multiselect(
+            "Filter by Progress", ["Unresolved", "Resolved"],
+            default=["Unresolved", "Resolved"]
+        )
+    with filter_col2:
+        filter_village = st.multiselect(
+            "Filter by Village", df['Village'].unique().tolist(),
+            default=df['Village'].unique().tolist()
+        )
+
+    df_filtered = df[df['Progress'].isin(filter_progress) & df['Village'].isin(filter_village)]
+    df_sorted = df_filtered.sort_values('ID', ascending=False)
+
+    for _, row in df_sorted.iterrows():
+        report_id = int(row['ID'])
+        progress_color = "#ff4b2b" if row['Progress'] == "Unresolved" else "#69f0ae"
+
+        with st.container():
+            header_col, badge_col = st.columns([5, 1])
+            with header_col:
+                st.markdown(
+                    f"#### 📌 Report #{report_id} — {row['Village']} "
+                    f"<span style='color:gray; font-size:0.85rem;'>{str(row['Date'])[:10]}</span>",
+                    unsafe_allow_html=True
+                )
+            with badge_col:
+                st.markdown(
+                    f"<div style='background:{progress_color}; color:white; border-radius:8px; "
+                    f"padding:4px 10px; font-size:0.8rem; font-weight:700; text-align:center; margin-top:8px;'>"
+                    f"{row['Progress']}</div>",
+                    unsafe_allow_html=True
+                )
+
+            info_col1, info_col2 = st.columns(2)
+            with info_col1:
+                st.markdown(f"- **Reporter:** {row['Reporter']}")
+                st.markdown(f"- **Location:** {row['Location'] or 'N/A'}")
+                st.markdown(f"- **Symptoms:** {row['Symptom Count']} cases — {row['Symptoms']}")
+            with info_col2:
+                st.markdown(f"- **Water Source:** {row['Water Source']} ({row['Water Quality']})")
+                st.markdown(f"- **AI Risk Level:** {row['Risk Level']}")
+
+            if row['Image Path'] and pd.notna(row['Image Path']) and os.path.exists(str(row['Image Path'])):
+                st.image(row['Image Path'], caption="Original Evidence Photo", width=280)
+
+            # Thread of updates
+            updates_df = get_report_updates(report_id)
+            if not updates_df.empty:
+                st.markdown("**Update Thread:**")
+                for _, u_row in updates_df.iterrows():
+                    update_id = int(u_row['id'])
+                    u_status = u_row.get('update_status', 'Pending') or 'Pending'
+                    u_comment = u_row.get('admin_comment', '') or ''
+                    u_photo = u_row.get('update_photo_path', '') or ''
+
+                    s_color = "orange" if u_status == "Pending" else "green" if u_status == "Accepted" else "red"
+
+                    with st.expander(
+                        f"Update by {u_row['updated_by']} on {u_row['update_date']} — Status: {u_status}",
+                        expanded=(u_status == "Pending")
+                    ):
+                        st.markdown(f"**Details:** {u_row['update_text']}")
+                        if u_photo and os.path.exists(u_photo):
+                            st.image(u_photo, caption="Update Photo", width=250)
+                        st.markdown(
+                            f"<span style='color:{s_color}; font-weight:700;'>Status: {u_status}</span>",
+                            unsafe_allow_html=True
+                        )
+                        if u_comment:
+                            st.info(f"**Your Response:** {u_comment}")
+
+                        # Admin action form — only for pending updates on unresolved reports
+                        if u_status == "Pending" and row['Progress'] != "Resolved":
+                            with st.form(f"admin_action_{update_id}"):
+                                admin_comment = st.text_area(
+                                    "Admin Comment / Feedback",
+                                    placeholder="Provide feedback to the worker..."
+                                )
+                                a_col1, a_col2 = st.columns(2)
+                                with a_col1:
+                                    accept_btn = st.form_submit_button("Accept and Resolve")
+                                with a_col2:
+                                    reject_btn = st.form_submit_button("Reject")
+
+                                if accept_btn:
+                                    resolve_report_update(update_id, "Accepted", admin_comment)
+                                    st.success("Update accepted. Report marked as Resolved.")
+                                    st.rerun()
+                                elif reject_btn:
+                                    resolve_report_update(update_id, "Rejected", admin_comment)
+                                    st.warning("Update rejected. Worker will be notified.")
+                                    st.rerun()
+            else:
+                st.caption("No updates yet for this report.")
+
+            st.divider()
+
+def show_login():
+
+    st.markdown("""
+        <div style="max-width: 400px; margin: 0 auto; padding-top: 50px;">
+            <h2 style="text-align: center; color: #00f2fe;">🔐 Secure Portal</h2>
+            <p style="text-align: center; color: #81d4fa; margin-bottom: 30px;">Authorized Health Personnel Only</p>
+        </div>
+    """, unsafe_allow_html=True)
+    
+    with st.container():
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            with st.form("login_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                submit = st.form_submit_button("LOGIN")
+                
+                if submit:
+                    user = verify_user(username, password)
+                    if user:
+                        st.session_state.user = user
+                        st.session_state.app_page = "Home"
+                        st.success(f"Welcome back, {user['username']}!")
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password")
+
+def show_user_management():
+    st.title("👤 User Management")
+    user = st.session_state.user
+    
+    if user['role'] not in ['super_admin', 'admin']:
+        st.error("Unauthorized access.")
+        return
+
+    tab1, tab2 = st.tabs(["Create User", "Existing Users"])
+    
+    with tab1:
+        st.subheader("Add New Personnel")
+        with st.form("add_user_form"):
+            new_username = st.text_input("Username")
+            new_password = st.text_input("Password", type="password")
+            
+            roles = []
+            if user['role'] == 'super_admin':
+                roles = ['admin', 'worker']
+            elif user['role'] == 'admin':
+                roles = ['worker']
+                
+            new_role = st.selectbox("Role", roles)
+            add_submit = st.form_submit_button("CREATE USER")
+            
+            if add_submit:
+                if new_username and new_password:
+                    if add_user(new_username, new_password, new_role, user['id']):
+                        st.success(f"User {new_username} created successfully as {new_role}.")
+                    else:
+                        st.error("Username already exists or error occurred.")
+                else:
+                    st.warning("Please fill all fields.")
+                    
+    with tab2:
+        st.subheader("Manage Personnel")
+        users_list = get_all_users(user['id'], user['role'])
+        if users_list:
+            user_df = pd.DataFrame(users_list, columns=["ID", "Username", "Role"])
+            st.dataframe(user_df, use_container_width=True)
+        else:
+            st.info("No users found.")
+
 # --- MAIN APP NAVIGATION ---
 def main():
     # Activate cursor glitter immediately
@@ -1132,10 +1948,39 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
+    # AUTH CHECK (Critical: Show login if not authenticated)
+    if not st.session_state.user:
+        show_login()
+        return
+
+    # USER CONTEXT IN SIDEBAR
+    with st.sidebar:
+        st.markdown(f"""
+            <div class="sidebar-card" style="margin-top: 15px; border-left: 3px solid #69f0ae;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="font-size: 1.2rem;">👤</span>
+                    <div style="display: flex; flex-direction: column;">
+                        <span style="color: #ffffff; font-weight: 600; font-size: 0.85rem;">{st.session_state.user['username']}</span>
+                        <span style="color: #69f0ae; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px;">{st.session_state.user['role'].replace('_', ' ')}</span>
+                    </div>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+        
+        if st.button("🚪 LOGOUT", use_container_width=True):
+            logout_user()
+
     # TOP NAVBAR
     st.markdown('<div class="top-nav-marker"></div>', unsafe_allow_html=True)
     pages = ["Home", "Report Symptoms", "Risk Analysis", "Map View", "Health Awareness"]
     icons = ["🏠", "📝", "📊", "🗺️", "🛡️"]
+    
+    # Dynamic Navbar for Admins
+    if st.session_state.user['role'] in ['super_admin', 'admin']:
+        pages.append("Logs")
+        icons.append("🛡️")
+        pages.append("User Management")
+        icons.append("👥")
     
     # Create the horizontal navbar
     nav_cols = st.columns(len(pages))
@@ -1162,6 +2007,15 @@ def main():
         show_map_view()
     elif st.session_state.app_page == "Health Awareness":
         show_health_awareness()
+    elif st.session_state.app_page == "Logs" and st.session_state.user['role'] in ['super_admin', 'admin']:
+        show_logs()
+    elif st.session_state.app_page == "User Management" and "User Management" in pages:
+        show_user_management()
+
+def logout_user():
+    st.session_state.user = None
+    st.session_state.app_page = "Home"
+    st.rerun()
         
     
 if __name__ == "__main__":
